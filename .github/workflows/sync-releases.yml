@@ -3,7 +3,10 @@ name: Sync Upstream Releases
 on:
   workflow_dispatch:
   schedule:
-    - cron: "19 * * * *"
+    - cron: "4 * * * *"
+   
+  repository_dispatch:
+    types: [remote-cron-trigger] 
 
 permissions:
   contents: write
