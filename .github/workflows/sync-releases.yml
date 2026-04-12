@@ -2,14 +2,15 @@ name: Sync Upstream Releases
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "4 * * * *"
-   
   repository_dispatch:
-    types: [remote-cron-trigger] 
+    types: [remote-cron-trigger]
 
 permissions:
   contents: write
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
 
 jobs:
   sync-releases:
@@ -26,6 +27,8 @@ jobs:
 
       - name: Sync releases from upstream
         uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -45,7 +48,7 @@ jobs:
             }
 
             function safeName(name) {
-              return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+              return String(name).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
             }
 
             async function listAllReleases(owner, repo) {
@@ -75,36 +78,49 @@ jobs:
 
             async function createOrUpdateRelease(upstreamRelease) {
               const tag = upstreamRelease.tag_name;
-              let existing = await findReleaseByTag(owner, repo, tag);
+              const existing = await findReleaseByTag(owner, repo, tag);
 
-              const payload = {
-                owner,
-                repo,
-                tag_name: tag,
-                name: upstreamRelease.name || tag,
-                body: upstreamRelease.body || '',
-                draft: false,
-                prerelease: upstreamRelease.prerelease || false
-              };
+              const releaseName = upstreamRelease.name || tag;
+              const releaseBody = upstreamRelease.body || '';
+              const prerelease = !!upstreamRelease.prerelease;
 
               if (!existing) {
                 core.info(`Creating release: ${tag}`);
-                const created = await github.rest.repos.createRelease(payload);
-                return created.data;
-              } else {
-                core.info(`Updating release: ${tag}`);
-                const updated = await github.rest.repos.updateRelease({
+                const created = await github.rest.repos.createRelease({
                   owner,
                   repo,
-                  release_id: existing.id,
                   tag_name: tag,
-                  name: upstreamRelease.name || tag,
-                  body: upstreamRelease.body || '',
+                  name: releaseName,
+                  body: releaseBody,
                   draft: false,
-                  prerelease: upstreamRelease.prerelease || false
+                  prerelease
                 });
-                return updated.data;
+                return created.data;
               }
+
+              const needUpdate =
+                existing.name !== releaseName ||
+                (existing.body || '') !== releaseBody ||
+                !!existing.prerelease !== prerelease ||
+                !!existing.draft !== false;
+
+              if (!needUpdate) {
+                core.info(`Release unchanged: ${tag}`);
+                return existing;
+              }
+
+              core.info(`Updating release metadata: ${tag}`);
+              const updated = await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: existing.id,
+                tag_name: tag,
+                name: releaseName,
+                body: releaseBody,
+                draft: false,
+                prerelease
+              });
+              return updated.data;
             }
 
             async function listReleaseAssets(owner, repo, release_id) {
@@ -119,40 +135,57 @@ jobs:
               );
             }
 
-            async function deleteAssetIfExists(targetRelease, assetName) {
-              const assets = await listReleaseAssets(owner, repo, targetRelease.id);
-              const existing = assets.find(a => a.name === assetName);
-              if (existing) {
-                core.info(`Deleting old asset before re-upload: ${assetName}`);
-                await github.rest.repos.deleteReleaseAsset({
-                  owner,
-                  repo,
-                  asset_id: existing.id
-                });
-              }
+            async function deleteReleaseAsset(assetId, assetName) {
+              core.info(`Deleting old asset: ${assetName}`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: assetId
+              });
             }
 
             function downloadFile(url, outputPath) {
               core.info(`Downloading asset: ${url}`);
-              execSync(`curl -L --fail -H "Accept: application/octet-stream" "${url}" -o "${outputPath}"`, {
-                stdio: 'inherit'
-              });
+              try {
+                execSync(
+                  `curl -L --fail --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 15 ` +
+                  `-H "Accept: application/octet-stream" ` +
+                  `"${url}" -o "${outputPath}"`,
+                  { stdio: 'inherit' }
+                );
+              } catch (err) {
+                core.error(`Download failed after retries: ${url}`);
+                throw err;
+              }
             }
 
             function uploadAsset(uploadUrl, filePath, assetName, contentType) {
               core.info(`Uploading asset: ${assetName}`);
               const stat = fs.statSync(filePath);
               const cleanUploadUrl = uploadUrl.replace(/\{.*$/, '');
+
               execSync(
-                `curl -L --fail \
-                  -X POST \
-                  -H "Authorization: Bearer ${process.env.GITHUB_TOKEN}" \
-                  -H "Content-Type: ${contentType}" \
-                  -H "Content-Length: ${stat.size}" \
-                  --data-binary @"${filePath}" \
-                  "${cleanUploadUrl}?name=${encodeURIComponent(assetName)}"`,
+                `curl -L --fail ` +
+                `-X POST ` +
+                `-H "Authorization: Bearer ${process.env.GITHUB_TOKEN}" ` +
+                `-H "Content-Type: ${contentType}" ` +
+                `-H "Content-Length: ${stat.size}" ` +
+                `--data-binary @"${filePath}" ` +
+                `"${cleanUploadUrl}?name=${encodeURIComponent(assetName)}"`,
                 { stdio: 'inherit' }
               );
+            }
+
+            function isAssetSame(targetAsset, upstreamAsset) {
+              if (!targetAsset) return false;
+
+              const sameName = targetAsset.name === upstreamAsset.name;
+              const sameSize = Number(targetAsset.size || 0) === Number(upstreamAsset.size || 0);
+              const sameContentType =
+                String(targetAsset.content_type || 'application/octet-stream') ===
+                String(upstreamAsset.content_type || 'application/octet-stream');
+
+              return sameName && sameSize && sameContentType;
             }
 
             async function syncAssets(upstreamRelease, targetRelease) {
@@ -162,40 +195,64 @@ jobs:
                 return;
               }
 
+              const targetAssets = await listReleaseAssets(owner, repo, targetRelease.id);
+
               for (const asset of upstreamAssets) {
                 const assetName = asset.name;
                 const safeAssetName = safeName(assetName);
-                const outputPath = path.join(workDir, `${upstreamRelease.tag_name}-${safeAssetName}`);
+                const safeTag = safeName(upstreamRelease.tag_name);
+                const outputPath = path.join(workDir, `${safeTag}-${safeAssetName}`);
                 const contentType = asset.content_type || 'application/octet-stream';
 
-                // 始终按“覆盖上传”逻辑执行：
-                // 如果同名附件已存在，先删除再重新上传
-                await deleteAssetIfExists(targetRelease, assetName);
+                const existing = targetAssets.find(a => a.name === assetName);
 
-                downloadFile(asset.browser_download_url, outputPath);
-                uploadAsset(targetRelease.upload_url, outputPath, assetName, contentType);
-
-                if (fs.existsSync(outputPath)) {
-                  fs.unlinkSync(outputPath);
+                if (isAssetSame(existing, asset)) {
+                  core.info(`Skipping unchanged asset: ${assetName}`);
+                  continue;
                 }
+
+                if (existing) {
+                  await deleteReleaseAsset(existing.id, existing.name);
+                }
+
+                try {
+                  downloadFile(asset.browser_download_url, outputPath);
+                  uploadAsset(targetRelease.upload_url, outputPath, assetName, contentType);
+                } finally {
+                  if (fs.existsSync(outputPath)) {
+                    fs.unlinkSync(outputPath);
+                  }
+                }
+
+                // 文件间稍微停顿，防止触发网络限制
+                await new Promise(resolve => setTimeout(resolve, 1000));
               }
             }
 
-            const upstreamReleases = await listAllReleases(upstreamOwner, upstreamRepo);
+            async function main() {
+              core.info(`Upstream repo: ${upstreamOwner}/${upstreamRepo}`);
+              core.info(`Target repo: ${owner}/${repo}`);
 
-            core.info(`Found ${upstreamReleases.length} upstream releases`);
+              const upstreamReleases = await listAllReleases(upstreamOwner, upstreamRepo);
+              core.info(`Found ${upstreamReleases.length} upstream releases`);
 
-            for (const upstreamRelease of upstreamReleases) {
-              if (upstreamRelease.draft) {
-                core.info(`Skipping draft release: ${upstreamRelease.tag_name}`);
-                continue;
+              // 从旧到新处理，保证最新 release 最后同步
+              const sortedReleases = [...upstreamReleases].reverse();
+
+              for (const upstreamRelease of sortedReleases) {
+                const tag = upstreamRelease.tag_name || '(no-tag)';
+
+                if (upstreamRelease.draft) {
+                  core.info(`Skipping draft release: ${tag}`);
+                  continue;
+                }
+
+                core.info(`Processing release: ${tag}`);
+                const targetRelease = await createOrUpdateRelease(upstreamRelease);
+                await syncAssets(upstreamRelease, targetRelease);
               }
 
-              const targetRelease = await createOrUpdateRelease(upstreamRelease);
-              await syncAssets(upstreamRelease, targetRelease);
+              core.info('Release sync completed.');
             }
 
-            core.info('Release sync completed.');
-
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            await main();
